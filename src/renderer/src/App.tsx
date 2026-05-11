@@ -5,23 +5,17 @@ import Welcome from "./screens/Welcome/Welcome";
 import Install from "./screens/Install/Install";
 import Setup from "./screens/Setup/Setup";
 import Layout from "./screens/Layout/Layout";
-import SplashScreen from "./screens/SplashScreen/SplashScreen";
 import { useI18n } from "./components/useI18n";
 
-type Screen = "splash" | "welcome" | "installing" | "setup" | "main";
-
-// Minimum time the splash stays visible so the brand animation plays
-// through. Tracks the splash logo fade-in duration in main.css.
-const SPLASH_MIN_MS = 1300;
+type Screen = "loading" | "welcome" | "installing" | "setup" | "main";
 
 function App(): React.JSX.Element {
   const { t } = useI18n();
-  const [screen, setScreen] = useState<Screen>("splash");
+  const [screen, setScreen] = useState<Screen>("loading");
   const [installError, setInstallError] = useState<string | null>(null);
   const isMac = window.electron?.process?.platform === "darwin";
 
   const runInstallCheck = useCallback(async () => {
-    const startedAt = Date.now();
     let next: Screen = "welcome";
     let error: string | null = null;
     let isRemote = false;
@@ -31,7 +25,6 @@ function App(): React.JSX.Element {
       isRemote = conn.mode === "remote" || conn.mode === "ssh";
 
       if (conn.mode === "ssh" && conn.ssh) {
-        // Start (or ensure) the SSH tunnel, then go straight to main
         try {
           await window.hermesAPI.startSshTunnel();
           next = "main";
@@ -65,22 +58,9 @@ function App(): React.JSX.Element {
     }
 
     if (error) setInstallError(error);
-
-    const elapsed = Date.now() - startedAt;
-    const wait = Math.max(0, SPLASH_MIN_MS - elapsed);
-    if (wait > 0) {
-      await new Promise((r) => setTimeout(r, wait));
-    }
     setScreen(next);
 
-    // Lazy deep-verify in the background after the UI is up. If the
-    // install is broken, surface the warning then — don't block startup.
-    //
-    // Skip for remote-mode connections: verifyInstall() probes the LOCAL
-    // Python + script paths (HERMES_PYTHON / HERMES_SCRIPT in installer.ts),
-    // which don't exist on machines that only use a remote backend. Without
-    // this guard the user is bounced back to Welcome with an "installBroken"
-    // error immediately after a successful remote connect. (#47, #41, #30)
+    // Lazy deep-verify in the background after the UI is up.
     if ((next === "main" || next === "setup") && !isRemote) {
       window.hermesAPI.verifyInstall().then((ok) => {
         if (!ok) {
@@ -94,10 +74,6 @@ function App(): React.JSX.Element {
   useEffect(() => {
     runInstallCheck();
   }, [runInstallCheck]);
-
-  const handleSplashFinished = useCallback(() => {
-    /* splash transition is driven by the install check, not a timer */
-  }, []);
 
   function handleInstallComplete(): void {
     setInstallError(null);
@@ -116,14 +92,14 @@ function App(): React.JSX.Element {
 
   function handleRecheck(): void {
     setInstallError(null);
-    setScreen("splash");
+    setScreen("loading");
     runInstallCheck();
   }
 
   function renderScreen(): React.JSX.Element {
     switch (screen) {
-      case "splash":
-        return <SplashScreen onFinished={handleSplashFinished} />;
+      case "loading":
+        return <div />; // blank while checking, no branded splash
       case "welcome":
         return (
           <Welcome
