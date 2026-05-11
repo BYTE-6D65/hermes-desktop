@@ -1,7 +1,8 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import yaml from "js-yaml";
 import { HERMES_HOME } from "./installer";
-import { profileHome, escapeRegex, safeWriteFile } from "./utils";
+import { profileHome, safeWriteFile } from "./utils";
 
 // ── Connection Config (local / remote / ssh) ─────────────
 
@@ -92,9 +93,11 @@ function setCache(key: string, data: unknown): void {
 }
 
 function invalidateCache(prefix: string): void {
-  for (const key of _cache.keys()) {
-    if (key.startsWith(prefix)) _cache.delete(key);
-  }
+  const keysToDelete: string[] = [];
+  _cache.forEach((_, key) => {
+    if (key.startsWith(prefix)) keysToDelete.push(key);
+  });
+  keysToDelete.forEach((key) => _cache.delete(key));
 }
 
 function profilePaths(profile?: string): {
@@ -109,6 +112,8 @@ function profilePaths(profile?: string): {
     configFile: join(home, "config.yaml"),
   };
 }
+
+// ── .env file helpers (line-based, regex is fine here) ───
 
 export function readEnv(profile?: string): Record<string, string> {
   const cacheKey = `env:${profile || "default"}`;
@@ -159,10 +164,11 @@ export function setEnvValue(
   const content = readFileSync(envFile, "utf-8");
   const lines = content.split("\n");
   let found = false;
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   for (let i = 0; i < lines.length; i++) {
     const trimmed = lines[i].trim();
-    if (trimmed.match(new RegExp(`^#?\\s*${escapeRegex(key)}\\s*=`))) {
+    if (trimmed.match(new RegExp(`^#?\\s*${escapedKey}\\s*=`))) {
       lines[i] = `${key}=${value}`;
       found = true;
       break;
@@ -176,17 +182,45 @@ export function setEnvValue(
   safeWriteFile(envFile, lines.join("\n"));
 }
 
-export function getConfigValue(key: string, profile?: string): string | null {
+// ── YAML config helpers (js-yaml based) ──────────────────
+//
+// Reads and writes ~/.hermes/config.yaml using proper YAML parsing.
+// Falls back gracefully if the file is malformed — returns empty/null
+// values rather than crashing.
+
+function readYamlConfig(
+  profile?: string,
+): Record<string, unknown> | null {
   const { configFile } = profilePaths(profile);
   if (!existsSync(configFile)) return null;
+  try {
+    const content = readFileSync(configFile, "utf-8");
+    return yaml.load(content) as Record<string, unknown> | null;
+  } catch {
+    return null;
+  }
+}
 
-  const content = readFileSync(configFile, "utf-8");
-  const regex = new RegExp(
-    `^\\s*${escapeRegex(key)}:\\s*["']?([^"'\\n#]+)["']?`,
-    "m",
-  );
-  const match = content.match(regex);
-  return match ? match[1].trim() : null;
+function writeYamlConfig(
+  data: Record<string, unknown>,
+  profile?: string,
+): void {
+  const { configFile } = profilePaths(profile);
+  const content = yaml.dump(data, {
+    lineWidth: -1, // don't wrap long lines
+    quotingType: '"', // prefer double quotes
+    forceQuotes: false,
+    skipInvalid: true,
+  });
+  safeWriteFile(configFile, content);
+}
+
+export function getConfigValue(key: string, profile?: string): string | null {
+  const data = readYamlConfig(profile);
+  if (!data) return null;
+  const value = data[key];
+  if (value === undefined || value === null) return null;
+  return String(value);
 }
 
 export function setConfigValue(
@@ -194,20 +228,11 @@ export function setConfigValue(
   value: string,
   profile?: string,
 ): void {
-  const { configFile } = profilePaths(profile);
-  if (!existsSync(configFile)) return;
-
-  let content = readFileSync(configFile, "utf-8");
-  const regex = new RegExp(
-    `^(\\s*#?\\s*${escapeRegex(key)}:\\s*)["']?[^"'\\n#]*["']?`,
-    "m",
-  );
-
-  if (regex.test(content)) {
-    content = content.replace(regex, `$1"${value}"`);
-  }
-
-  safeWriteFile(configFile, content);
+  const data = readYamlConfig(profile);
+  if (!data) return;
+  data[key] = value;
+  invalidateCache(`mc:${profile || "default"}`);
+  writeYamlConfig(data, profile);
 }
 
 export function getModelConfig(profile?: string): {
@@ -219,20 +244,15 @@ export function getModelConfig(profile?: string): {
   const cached = getCached<{ provider: string; model: string; baseUrl: string }>(cacheKey);
   if (cached) return cached;
 
-  const { configFile } = profilePaths(profile);
   const defaults = { provider: "auto", model: "", baseUrl: "" };
-  if (!existsSync(configFile)) return defaults;
+  const data = readYamlConfig(profile);
+  if (!data) return defaults;
 
-  const content = readFileSync(configFile, "utf-8");
-
-  const providerMatch = content.match(/^\s*provider:\s*["']?([^"'\n#]+)["']?/m);
-  const modelMatch = content.match(/^\s*default:\s*["']?([^"'\n#]+)["']?/m);
-  const baseUrlMatch = content.match(/^\s*base_url:\s*["']?([^"'\n#]+)["']?/m);
-
+  const modelBlock = data.model as Record<string, unknown> | undefined;
   const result = {
-    provider: providerMatch ? providerMatch[1].trim() : defaults.provider,
-    model: modelMatch ? modelMatch[1].trim() : defaults.model,
-    baseUrl: baseUrlMatch ? baseUrlMatch[1].trim() : defaults.baseUrl,
+    provider: String(modelBlock?.provider ?? defaults.provider),
+    model: String(modelBlock?.default ?? defaults.model),
+    baseUrl: String(modelBlock?.base_url ?? defaults.baseUrl),
   };
 
   setCache(cacheKey, result);
@@ -246,46 +266,29 @@ export function setModelConfig(
   profile?: string,
 ): void {
   invalidateCache(`mc:${profile || "default"}`);
-  const { configFile } = profilePaths(profile);
-  if (!existsSync(configFile)) return;
+  const data = readYamlConfig(profile);
+  if (!data) return;
 
-  let content = readFileSync(configFile, "utf-8");
+  // Set model block
+  if (!data.model || typeof data.model !== "object") {
+    data.model = {};
+  }
+  const modelBlock = data.model as Record<string, unknown>;
+  modelBlock.provider = provider;
+  modelBlock.default = model;
+  modelBlock.base_url = baseUrl;
 
-  const providerRegex = /^(\s*provider:\s*)["']?[^"'\n#]*["']?/m;
-  if (providerRegex.test(content)) {
-    content = content.replace(providerRegex, `$1"${provider}"`);
+  // Disable smart_model_routing if it exists
+  if (data.smart_model_routing && typeof data.smart_model_routing === "object") {
+    (data.smart_model_routing as Record<string, unknown>).enabled = false;
   }
 
-  const modelRegex = /^(\s*default:\s*)["']?[^"'\n#]*["']?/m;
-  if (modelRegex.test(content)) {
-    content = content.replace(modelRegex, `$1"${model}"`);
+  // Enable streaming if the key exists
+  if ("streaming" in data) {
+    data.streaming = true;
   }
 
-  const baseUrlRegex = /^(\s*base_url:\s*)["']?[^"'\n#]*["']?/m;
-  if (baseUrlRegex.test(content)) {
-    content = content.replace(baseUrlRegex, `$1"${baseUrl}"`);
-  }
-
-  // Disable smart_model_routing
-  const lines = content.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (
-      /^\s*enabled:\s*(true|false)/.test(lines[i]) &&
-      i > 0 &&
-      /smart_model_routing/.test(lines[i - 1])
-    ) {
-      lines[i] = lines[i].replace(/(enabled:\s*)(true|false)/, "$1false");
-    }
-  }
-  content = lines.join("\n");
-
-  // Enable streaming
-  const streamingRegex = /^(\s*streaming:\s*)(\S+)/m;
-  if (streamingRegex.test(content)) {
-    content = content.replace(streamingRegex, "$1true");
-  }
-
-  safeWriteFile(configFile, content);
+  writeYamlConfig(data, profile);
 }
 
 export function getHermesHome(profile?: string): string {
@@ -297,20 +300,21 @@ export function getHermesHome(profile?: string): string {
 const SUPPORTED_PLATFORMS = ["telegram", "discord", "slack", "whatsapp", "signal"];
 
 export function getPlatformEnabled(profile?: string): Record<string, boolean> {
-  const { configFile } = profilePaths(profile);
-  if (!existsSync(configFile)) return {};
+  const data = readYamlConfig(profile);
+  if (!data) return {};
 
-  const content = readFileSync(configFile, "utf-8");
+  const platforms = data.platforms as Record<string, unknown> | undefined;
+  if (!platforms || typeof platforms !== "object") return {};
+
   const result: Record<string, boolean> = {};
-
   for (const platform of SUPPORTED_PLATFORMS) {
-    // Match "  platform:\n    enabled: true/false" under the platforms: block
-    const re = new RegExp(
-      `^[ \\t]+${platform}:\\s*\\n[ \\t]+enabled:\\s*(true|false)`,
-      "m",
-    );
-    const match = content.match(re);
-    result[platform] = match ? match[1] === "true" : false;
+    const entry = platforms[platform];
+    if (entry && typeof entry === "object") {
+      const enabled = (entry as Record<string, unknown>).enabled;
+      result[platform] = enabled === true;
+    } else {
+      result[platform] = false;
+    }
   }
 
   return result;
@@ -323,56 +327,20 @@ export function setPlatformEnabled(
 ): void {
   if (!SUPPORTED_PLATFORMS.includes(platform)) return;
 
-  const { configFile } = profilePaths(profile);
-  if (!existsSync(configFile)) return;
+  const data = readYamlConfig(profile);
+  if (!data) return;
 
-  let content = readFileSync(configFile, "utf-8");
-
-  // Check if the platform entry already exists under platforms:
-  const existingRe = new RegExp(
-    `^([ \\t]+${platform}:\\s*\\n[ \\t]+enabled:\\s*)(?:true|false)`,
-    "m",
-  );
-
-  if (existingRe.test(content)) {
-    // Update existing entry
-    content = content.replace(existingRe, `$1${enabled}`);
-  } else {
-    // Append new platform entry after the platforms: block
-    // Find the platforms: line and insert after the last existing platform entry
-    const platformsIdx = content.indexOf("\nplatforms:");
-    if (platformsIdx === -1) {
-      // No platforms section at all — append one
-      content += `\nplatforms:\n  ${platform}:\n    enabled: ${enabled}\n`;
-    } else {
-      // Insert the new platform at the end of the platforms block.
-      // Find the next top-level key (non-indented, non-comment, non-empty line)
-      // after the platforms: line.
-      const afterPlatforms = content.substring(platformsIdx + 1);
-      const lines = afterPlatforms.split("\n");
-      let insertOffset = platformsIdx + 1; // after the \n
-      // Skip the "platforms:" line itself
-      insertOffset += lines[0].length + 1;
-
-      // Skip all indented lines (children of platforms:)
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i];
-        if (line.trim() === "" || /^\s/.test(line)) {
-          insertOffset += line.length + 1;
-        } else {
-          break;
-        }
-      }
-
-      const entry = `  ${platform}:\n    enabled: ${enabled}\n`;
-      content =
-        content.substring(0, insertOffset) +
-        entry +
-        content.substring(insertOffset);
-    }
+  if (!data.platforms || typeof data.platforms !== "object") {
+    data.platforms = {};
   }
+  const platforms = data.platforms as Record<string, unknown>;
 
-  safeWriteFile(configFile, content);
+  if (!platforms[platform] || typeof platforms[platform] !== "object") {
+    platforms[platform] = {};
+  }
+  (platforms[platform] as Record<string, unknown>).enabled = enabled;
+
+  writeYamlConfig(data, profile);
 }
 
 // ── Credential Pool (auth.json) ──────────────────────────
